@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-lanwatch.py v2.2.0
+lanwatch.py v2.2.2
 Passive multicast LAN service observer.
 
 Designed for:
@@ -54,6 +54,7 @@ Linux:
 """
 
 import json
+import ipaddress
 import os
 import platform
 import select
@@ -67,7 +68,7 @@ from collections import defaultdict
 from datetime import datetime
 
 
-VERSION = "2.2.0"
+VERSION = "2.2.2"
 
 MDNS_GROUP = "224.0.0.251"
 MDNS_PORT = 5353
@@ -976,9 +977,15 @@ services = defaultdict(
         "port": None,
         "txt": set(),
         "addresses": set(),
-        "sources": set(),
+        "owners": set(),
+        "observed_from": set(),
     }
 )
+
+# Address records can arrive before or after the matching SRV record.
+host_addresses = defaultdict(set)
+reverse_records = set()
+inferred_inventory_ips = set()
 
 
 def touch_device(
@@ -1067,8 +1074,7 @@ def learn_mdns(
         + parsed["additional"]
     )
 
-    # First pass:
-    # host addressing.
+    # Address records describe their named host, not the packet sender.
     for record in records:
         rtype = record["type"]
         name = record["name"]
@@ -1078,28 +1084,12 @@ def learn_mdns(
             "A",
             "AAAA"
         ):
-            if name:
-                d["hostnames"].add(
-                    name
-                )
-
-            if value:
-                d["addresses"].add(
-                    str(value)
-                )
-
-                for svc in (
-                    services.values()
-                ):
-                    if (
-                        svc["target"]
-                        == name
-                    ):
-                        svc[
-                            "addresses"
-                        ].add(
-                            str(value)
-                        )
+            if name and value:
+                addresses = host_addresses[name.lower()]
+                if record.get("ttl") == 0:
+                    addresses.discard(str(value))
+                else:
+                    addresses.add(str(value))
 
     # Second pass:
     # PTR / SRV / TXT correlation.
@@ -1121,32 +1111,18 @@ def learn_mdns(
                     else ""
                 )
 
-                if target:
-                    d[
-                        "reverse_dns"
-                    ].add(
-                        f"{name} "
-                        f"-> {target}"
-                    )
-
+                # Reverse PTR ownership is derived from its name below.
+                pair = (name, target)
+                if record.get("ttl") == 0:
+                    reverse_records.discard(pair)
                 else:
-                    d[
-                        "reverse_dns"
-                    ].add(
-                        name
-                    )
+                    reverse_records.add(pair)
 
                 continue
 
             if is_dns_sd_service_type(
                 name
             ):
-                d[
-                    "service_types"
-                ].add(
-                    name
-                )
-
                 if (
                     isinstance(
                         value,
@@ -1157,11 +1133,8 @@ def learn_mdns(
                     if is_service_instance(
                         value
                     ):
-                        d[
-                            "service_instances"
-                        ].add(
-                            value
-                        )
+                        if record.get("ttl") == 0:
+                            continue
 
                         svc = services[
                             value
@@ -1172,7 +1145,7 @@ def learn_mdns(
                         ] = name
 
                         svc[
-                            "sources"
+                            "observed_from"
                         ].add(
                             ip
                         )
@@ -1197,18 +1170,16 @@ def learn_mdns(
             if is_service_instance(
                 name
             ):
-                d[
-                    "service_instances"
-                ].add(
-                    name
-                )
+                if record.get("ttl") == 0:
+                    services.pop(name, None)
+                    continue
 
                 svc = services[
                     name
                 ]
 
                 svc[
-                    "sources"
+                    "observed_from"
                 ].add(
                     ip
                 )
@@ -1229,22 +1200,12 @@ def learn_mdns(
                         "target"
                     ] = target
 
-                    d[
-                        "hostnames"
-                    ].add(
-                        target
-                    )
 
                 if port:
                     svc[
                         "port"
                     ] = port
 
-                    d[
-                        "ports"
-                    ].add(
-                        port
-                    )
 
         elif rtype == "TXT":
             if not isinstance(
@@ -1256,18 +1217,16 @@ def learn_mdns(
             if is_service_instance(
                 name
             ):
-                d[
-                    "service_instances"
-                ].add(
-                    name
-                )
+                if record.get("ttl") == 0:
+                    services.pop(name, None)
+                    continue
 
                 svc = services[
                     name
                 ]
 
                 svc[
-                    "sources"
+                    "observed_from"
                 ].add(
                     ip
                 )
@@ -1290,47 +1249,81 @@ def learn_mdns(
                         item
                     )
 
-                    d[
-                        "txt"
-                    ].add(
-                        item
-                    )
 
-    # Third pass:
-    # Attach A/AAAA records from this packet
-    # to service target hostnames.
-    host_address_map = (
-        defaultdict(set)
-    )
 
-    for record in records:
-        if record["type"] in (
-            "A",
-            "AAAA"
-        ):
-            if (
-                record["name"]
-                and record["value"]
-            ):
-                host_address_map[
-                    record["name"]
-                ].add(
-                    str(
-                        record["value"]
-                    )
-                )
 
-    for svc in services.values():
+def reconcile_mdns():
+    """Derive host fields from DNS ownership, regardless of arrival order."""
+    for ip in tuple(inferred_inventory_ips):
+        if ip in inventory and inventory[ip]["packets"] == 0:
+            del inventory[ip]
+        inferred_inventory_ips.discard(ip)
+
+    def owner_device(address):
+        if address not in inventory:
+            inferred_inventory_ips.add(address)
+        return inventory[address]
+
+    for d in inventory.values():
+        for field in ("hostnames", "addresses", "reverse_dns",
+                      "service_types", "service_instances", "ports", "txt"):
+            d[field].clear()
+
+    def owner_for(addresses):
+        # One device can advertise both A and AAAA for the same hostname.
+        # Prefer its IPv4 entry so a link-local alias is not a second device.
+        parsed = []
+        for address in addresses:
+            try:
+                parsed.append(ipaddress.ip_address(address))
+            except ValueError:
+                continue
+        if not parsed:
+            return None
+        return str(min(parsed, key=lambda address: (address.version != 4, int(address))))
+
+    for name, addresses in host_addresses.items():
+        owner = owner_for(addresses)
+        if owner:
+            d = owner_device(owner)
+            d["hostnames"].add(name)
+            d["addresses"].update(addresses)
+
+    for name, target in reverse_records:
+        try:
+            lower_name = name.lower().rstrip(".")
+            if lower_name.endswith(".in-addr.arpa"):
+                octets = lower_name.removesuffix(".in-addr.arpa").split(".")
+                address = str(ipaddress.ip_address(".".join(reversed(octets))))
+            elif lower_name.endswith(".ip6.arpa"):
+                nibbles = lower_name.removesuffix(".ip6.arpa").split(".")
+                if len(nibbles) != 32 or any(len(n) != 1 for n in nibbles):
+                    continue
+                address = str(ipaddress.ip_address(int("".join(reversed(nibbles)), 16)))
+            else:
+                address = None
+        except (ValueError, TypeError):
+            address = None
+        if address:
+            d = owner_device(address)
+            d["reverse_dns"].add(
+                f"{name} -> {target}" if target else name)
+            if target:
+                d["hostnames"].add(target)
+
+    for instance, svc in services.items():
         target = svc["target"]
-
-        if target in host_address_map:
-            svc[
-                "addresses"
-            ].update(
-                host_address_map[
-                    target
-                ]
-            )
+        svc["addresses"] = set(host_addresses.get(target.lower(), ())) if target else set()
+        owner = owner_for(svc["addresses"])
+        svc["owners"] = {owner} if owner else set()
+        if owner:
+            d = owner_device(owner)
+            d["service_instances"].add(instance)
+            if svc["service_type"]:
+                d["service_types"].add(svc["service_type"])
+            if svc["port"]:
+                d["ports"].add(svc["port"])
+            d["txt"].update(svc["txt"])
 
 
 # ============================================================
@@ -1788,7 +1781,7 @@ def service_objects_for_ip(ip):
         svc
     ) in services.items():
 
-        if ip not in svc["sources"]:
+        if ip not in svc["owners"]:
             continue
 
         result.append({
@@ -1817,6 +1810,7 @@ def service_objects_for_ip(ip):
 
 
 def serializable_inventory():
+    reconcile_mdns()
     result = {}
 
     for (
@@ -1861,6 +1855,7 @@ def serializable_inventory():
 
 
 def print_summary():
+    reconcile_mdns()
     print()
 
     print(
